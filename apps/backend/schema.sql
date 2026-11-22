@@ -249,8 +249,6 @@ CREATE TABLE IF NOT EXISTS signing_sessions (
 );
 CREATE INDEX IF NOT EXISTS signing_sessions_merchant_status_idx ON signing_sessions (merchant_id, status);
 ALTER TABLE webhook_deliveries ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMP WITH TIME ZONE;
-<<<<<<< HEAD
-=======
 
 -- Fiat-denominated plans & exchange rate oracle cache (#96)
 --
@@ -281,7 +279,6 @@ CREATE INDEX IF NOT EXISTS exchange_rates_pair_fetched_at_idx
     ON exchange_rates (base_currency, quote_currency, fetched_at DESC);
 -- Backend-only: service role bypasses RLS, no public policy is defined.
 ALTER TABLE exchange_rates ENABLE ROW LEVEL SECURITY;
->>>>>>> upstream/main
 
 -- 10. Invoices Table
 -- Stores billing invoices for merchant subscriptions, with cryptographic

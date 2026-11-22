@@ -92,16 +92,12 @@ function extractLimit(args) {
     return 1;
 }
 
-const GRAPHQL_MAX_COMPLEXITY = 1000;
-const GRAPHQL_INTERNAL_MAX_COMPLEXITY = 10000;
-
 function queryValidation(document, options = {}) {
     const fragments = new Map(document.definitions.filter((d) => d.kind === 'FragmentDefinition')
         .map((d) => [d.name.value, d]));
     let totalCost = 0;
     const fieldWeights = { payments: 25, payrollSplits: 20, subscriptions: 15, plans: 10 };
     const maxDepth = options.internalService ? GRAPHQL_INTERNAL_MAX_DEPTH : GRAPHQL_MAX_DEPTH;
-    const maxDepth = options.internalService ? 12 : GRAPHQL_MAX_DEPTH;
     function walk(selectionSet, depth = 1, seen = new Set()) {
         if (!selectionSet) return;
         if (depth > maxDepth) {
