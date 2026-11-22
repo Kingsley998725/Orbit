@@ -8,7 +8,7 @@ use soroban_sdk::{
 };
 
 /// Approximate duration of one Stellar ledger in seconds (~5 seconds per ledger).
-pub const SECONDS_PER_LEDGER: u64 = 5;>>> upstream/main
+pub const SECONDS_PER_LEDGER: u64 = 5;
 
 // ----------------------------------------------------------------------------
 // CONSTANTS: STATE ARCHIVAL & TTL MANAGEMENT
@@ -3626,6 +3626,35 @@ impl OrbitContract {
         );
     }
 
+    /// Delegated batch disbursement allowing relayers to submit signed disbursements
+    /// on behalf of the sender. Verifies the sender's Ed25519 signature, checks nonce
+    /// validity to prevent replay attacks, and enforces a deadline ledger.
+    pub fn batch_disburse_delegated(
+        env: Env,
+        sender: Address,
+        token: Address,
+        nonce: u64,
+        deadline_ledger: u32,
+        signature: Bytes,
+        public_key: Bytes,
+        splits: Vec<PaymentSplit>,
+    ) {
+        assert!(
+            env.ledger().sequence() <= deadline_ledger,
+            "deadline exceeded"
+        );
+        let pk_n = BytesN::<32>::try_from(public_key).expect("public key must be 32 bytes");
+        let sig_n = BytesN::<64>::try_from(signature).expect("signature must be 64 bytes");
+        let current_nonce = load_user_nonce(&env, &sender);
+        assert!(nonce == current_nonce, "invalid nonce");
+        let message =
+            delegated_batch_disburse_digest(&env, &sender, &token, nonce, deadline_ledger, &splits);
+        env.crypto()
+            .ed25519_verify(&pk_n, &Bytes::from_array(&env, &message.to_array()), &sig_n);
+        bump_user_nonce(&env, &sender, current_nonce);
+        Self::batch_disburse(env, sender, token, splits);
+    }
+
     /// 4. MULTI-SIG PAYROLL: PROPOSE
     /// The sender stages a batch disbursement that only executes once
     /// `required_approvals` distinct addresses from `approvers` approve it.
@@ -5461,6 +5490,60 @@ impl OrbitContract {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // BATCH VAULT RENEWAL (#316)
+    // -----------------------------------------------------------------------
+
+    pub fn batch_renew_vaults(
+        env: Env,
+        user: Address,
+        merchants: Vec<Address>,
+        extension_ledgers: u64,
+    ) {
+        user.require_auth();
+
+        let extension = extension_ledgers.min(u32::MAX as u64) as u32;
+        let current_sequence = env.ledger().sequence();
+        let mut renewed_count: u32 = 0;
+        let mut newest_expiration: u32 = 0;
+
+        for merchant in merchants.iter() {
+            if extension == 0 {
+                break;
+            }
+            let key = vault_key(&user, &merchant);
+            let Some(mut vault) = load_vault(&env, &key) else {
+                continue;
+            };
+            if remaining_vault_cap(&vault) == Some(0) {
+                continue;
+            }
+            let base = if vault.expiration_ledger == UNLIMITED_EXPIRATION_LEDGER {
+                current_sequence
+            } else {
+                vault.expiration_ledger.max(current_sequence)
+            };
+            let new_expiration = base.saturating_add(extension);
+            vault.expiration_ledger = new_expiration;
+            if vault.payment_status == PAYMENT_EXPIRED {
+                vault.payment_status = PAYMENT_ACTIVE;
+            }
+            save_vault(&env, &key, &vault);
+            let (threshold, extend_to) = calculate_ttl_params(vault.interval_seconds);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, threshold, extend_to);
+            env.storage().instance().extend_ttl(threshold, extend_to);
+            renewed_count += 1;
+            newest_expiration = newest_expiration.max(new_expiration);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_vaults_renewed"), user),
+            (renewed_count, newest_expiration),
+        );
+    }
+
     // ------------------------------------------------------------------------
     // #223: EMERGENCY PAUSE AND TIMELOCKED CIRCUIT BREAKER
     // ------------------------------------------------------------------------
@@ -5975,6 +6058,29 @@ pub fn delegated_vault_digest(
     env.crypto().sha256(&data).to_bytes()
 }
 
+pub fn delegated_batch_disburse_digest(
+    env: &Env,
+    sender: &Address,
+    token: &Address,
+    nonce: u64,
+    deadline_ledger: u32,
+    splits: &Vec<PaymentSplit>,
+) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let mut params = sender.clone().to_xdr(env);
+    params.append(&token.clone().to_xdr(env));
+    for split in splits.iter() {
+        params.append(&split.to_xdr(env));
+    }
+    meta_digest(
+        env,
+        "batch_disburse_delegated",
+        &params,
+        nonce,
+        u64::from(deadline_ledger),
+    )
+}
+
 /// The Ed25519 key behind an account (`G...`) address, or `None` for any
 /// other address kind (e.g. a contract), which cannot sign with Ed25519.
 fn ed25519_account_key(env: &Env, user: &Address) -> Option<BytesN<32>> {
@@ -6078,64 +6184,6 @@ fn disburse(env: &Env, sender: &Address, splits: Vec<PaymentSplit>) {
             &split.recipient,
             &split.amount,
         );
-    }
-
-    /// Delegated batch disbursement allowing relayers to submit signed disbursements
-    /// on behalf of the sender. Verifies the sender's Ed25519 signature, checks nonce
-    /// validity to prevent replay attacks, and enforces a deadline ledger.
-    pub fn batch_disburse_delegated(
-        env: Env,
-        sender: Address,
-        token: Address,
-        nonce: u64,
-        deadline_ledger: u32,
-        signature: Bytes,
-        public_key: Bytes,
-        splits: Vec<PaymentSplit>,
-    ) {
-        // 1. Deadline check: reject if current ledger sequence > deadline_ledger
-        let current_ledger_seq = env.ledger().sequence();
-        assert!(
-            current_ledger_seq <= deadline_ledger,
-            "deadline exceeded"
-        );
-
-        // 2. Verify Ed25519 signature of the sender
-        // Convert the Bytes to the fixed-size types expected by ed25519_verify
-        let pk_array: [u8; 32] = {
-            let pk_slice = public_key.as_slice();
-            assert!(pk_slice.len() == 32, "public key must be 32 bytes");
-            pk_slice.try_into().unwrap()
-        };
-        let sig_array: [u8; 64] = {
-            let sig_slice = signature.as_slice();
-            assert!(sig_slice.len() == 64, "signature must be 64 bytes");
-            sig_slice.try_into().unwrap()
-        };
-        let pk_n = soroban_sdk::BytesN::<32>::from_array(&env, &pk_array);
-        let sig_n = soroban_sdk::BytesN::<64>::from_array(&env, &sig_array);
-
-        let message = Self::build_authorization_message(&env, &sender, &token, nonce, deadline_ledger, &splits);
-        let is_valid = env.crypto().ed25519_verify(&pk_n, &message, &sig_n);
-        assert!(
-            is_valid,
-            "invalid signature"
-        );
-        let existing_nonce: u64 = env
-            .storage()
-            .persistent()
-            .get(&nonce_key)
-            .unwrap_or(0);
-        assert!(
-            existing_nonce != nonce,
-            "nonce replay detected"
-        );
-        env.storage()
-            .persistent()
-            .set(&nonce_key, &(&nonce + 1));
-
-        // 3. Execute the batch disbursement
-        Self::batch_disburse(env.clone(), sender, token, splits);
     }
 }
 
