@@ -86,6 +86,13 @@ import {
   clearPendingSession,
 } from "./pendingSession"; // #265
 import { createTranslator } from "./i18n"; // #264
+import {
+  DETECTION_TIMEOUT_MS,
+  DETECTED_BADGE_LABEL,
+  detectInstalledWallets,
+  getQuickConnectWallet,
+  prioritizeWalletChoices,
+} from "./walletDetection";
 
 const STORAGE_KEY = "orbit:selected-wallet";
 const PENDING_KEY = "orbit:pending-transaction";
@@ -189,11 +196,54 @@ customClasses = {},
         : walletChoices,
     [walletChoices, isMobile],
   );
+  const visibleWalletIds = useMemo(
+    () => extensionWalletChoices.map(([id]) => id),
+    [extensionWalletChoices],
+  );
+  const [walletDetection, setWalletDetection] = useState({
+    detectedIds: [],
+    providers: {},
+    complete: false,
+  });
+  const detectedWalletIds = walletDetection.detectedIds;
+  const prioritizedWalletChoices = useMemo(
+    () => prioritizeWalletChoices(extensionWalletChoices, detectedWalletIds),
+    [extensionWalletChoices, detectedWalletIds],
+  );
+  const quickConnectWallet = walletDetection.complete
+    ? getQuickConnectWallet(prioritizedWalletChoices, detectedWalletIds)
+    : null;
+
   const [plan, setPlan] = useState(planData || null);
   const [loading, setLoading] = useState(!planData);
   const [error, setError] = useState("");
   const [address, setAddress] = useState("");
   const [showWallets, setShowWallets] = useState(false);
+
+  useEffect(() => {
+    if (!showWallets) return undefined;
+    let cancelled = false;
+    const empty = { detectedIds: [], providers: {}, complete: false };
+    setWalletDetection(empty);
+    detectInstalledWallets({
+      walletIds: visibleWalletIds,
+      timeoutMs: DETECTION_TIMEOUT_MS,
+      onDetected: (snapshot) => {
+        if (!cancelled) setWalletDetection({ ...snapshot, complete: false });
+      },
+    }).then(
+      (result) => {
+        if (!cancelled) setWalletDetection({ ...result, complete: true });
+      },
+      () => {
+        if (!cancelled) setWalletDetection({ ...empty, complete: true });
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [showWallets, visibleWalletIds]);
+
   const [processing, setProcessing] = useState(false);
   const [receipt, setReceipt] = useState(null);
   const [usdcReadiness, setUsdcReadiness] = useState(null);
@@ -839,10 +889,6 @@ customClasses = {},
       setError(message);
       setShowWallets(true);
       dispatch('orbit:error', { message });
-      const message =
-        reason?.message || "Biometric passkey authentication failed.";
-      setError(message);
-      dispatch("orbit:error", { message });
     }
   };
 
@@ -1263,7 +1309,6 @@ customClasses = {},
         );
       }
 
-      const activeWallet = passkeyAdapter || StellarWalletsKit;
       // #299: with a promo, the vault and allowance follow the discounted schedule
       const authTerms = promoAuthorization(plan, appliedCoupon);
       setConfirming(true);
@@ -1546,6 +1591,10 @@ let hashes;
           text-transform: uppercase;
         }
         .orbit-checkout-root .orbit-discount-pill {
+          display: inline-block; margin-left: 8px; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700;
+          background: rgba(16, 185, 129, 0.12); color: #059669; vertical-align: middle;
+        }
+        .orbit-checkout-root .orbit-wallet-detected-pill {
           display: inline-block; margin-left: 8px; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700;
           background: rgba(16, 185, 129, 0.12); color: #059669; vertical-align: middle;
         }
@@ -2150,29 +2199,6 @@ let hashes;
               </strong>{" "}
               {address.slice(0, 8)}...{address.slice(-5)}
             </p>
-            {isDemo && <p role="note">Demo mode never signs transactions or creates a subscription.</p>}
-            {termsUrl || privacyUrl && (
-              <div style={{ marginTop: 12, padding: 12, background: 'var(--orbit-surface)', border: '1px solid var(--orbit-border)', borderRadius: 'var(--orbit-radius)', fontSize: 12 }}>
-                <p style={{ marginBottom: 8, color: 'var(--orbit-text)' }}>
-                  {termsUrl ? <span style={{ color: 'var(--orbit-link)' }} onClick={() => window.open(termsUrl, '_blank') }>Terms of Service</span> : ''}
-                  {privacyUrl ? <span style={{ marginLeft: 12, color: 'var(--orbit-link)' }} onClick={() => window.open(privacyUrl, '_blank') }>Privacy Policy</span> : ''}
-                </p>
-                <label style={{ display: 'block', marginTop: 8, cursor: 'pointer' }}>
-                  <input
-                    type="checkbox"
-                    checked={agreedToTerms}
-                    onChange={(e) => setAgreedToTerms(e.target.checked)}
-                    style={{ transform: 'scale(1.2)', marginRight: 4 }}
-                  />
-                  I agree to the {"terms and conditions"} required to complete the subscription.
-                </label>
-              </div>
-            )}
-            <button
-              className={customClasses.button}
-              style={{ ...styles.button, opacity: isWrongNetwork ? 0.6 : 1, display: agreedToTerms || !termsUrl && !privacyUrl ? 1 : agreedToTerms ? 1 : 0.5 }}
-              disabled={processing || isWrongNetwork || (!agreedToTerms && (termsUrl || privacyUrl))}
-=======
             {isSessionKey && (
               <div
                 style={{
@@ -2360,32 +2386,24 @@ let hashes;
                 (!isSwap && !isDemo && (usdcCheckPending || !!usdcCheckError || usdcReadiness?.status !== "ready")) ||
                 (isSwap && (!swapQuote || swapQuoteLoading))
               }
->>>>>>> upstream/main
               onClick={subscribe}
               title={!isSwap && !isDemo ? (usdcCheckError || usdcReadinessMessage(usdcReadiness) || undefined) : undefined}
             >
               {!isOnline
-                ? 'Network Connection Unavailable'
+                ? "Network Connection Unavailable"
                 : processing
-                ? 'Preparing transaction...'
-                : isWrongNetwork
-                ? `Switch to ${targetNetworkName} to continue`
-                : isDemo
-                ? 'Preview success state'
-                : passkeyAdapter
-                ? 'Sign with Passkey'
-                : 'Authorize Subscription'}
-              {processing
-                ? "Preparing transaction..."
-                : !consentSatisfied
-                  ? "Agree to terms to continue"
+                  ? "Preparing transaction..."
                   : isWrongNetwork
                     ? `Switch to ${targetNetworkName} to continue`
-                    : isDemo
-                      ? "Preview success state"
-                      : isSessionKey
-                        ? "1-Click Subscribe (Zero Gas)"
-                        : "Subscribe & Approve"}
+                    : !consentSatisfied
+                      ? "Agree to terms to continue"
+                      : isDemo
+                        ? "Preview success state"
+                        : passkeyAdapter
+                          ? "Sign with Passkey"
+                          : isSessionKey
+                            ? "1-Click Subscribe (Zero Gas)"
+                            : "Subscribe & Approve"}
             </button>
             <button style={styles.cancel} onClick={handleOpenWallets}>
               Switch wallet
@@ -2395,6 +2413,7 @@ let hashes;
             </button>
           </>
         ) : (
+          <>
           <button
             className={customClasses.button}
             style={{ ...styles.button, opacity: !isOnline ? 0.6 : 1 }}
@@ -2426,8 +2445,8 @@ let hashes;
               </button>
             )}
           </div>
-        ))
-      )}
+          </>
+        )))}
 
       {error && (
         <p role="alert" style={styles.error}>
@@ -2446,6 +2465,36 @@ let hashes;
           style={styles.dialog}
         >
           <h3 id="wallet-title">Choose Payment Method</h3>
+          {quickConnectWallet && (
+            <button
+              data-testid={`wallet-quick-connect-${quickConnectWallet[0]}`}
+              style={{
+                ...styles.wallet,
+                borderColor: "var(--orbit-accent)",
+                background: "rgba(99, 102, 241, 0.1)",
+                marginBottom: 12,
+              }}
+              disabled={!consentSatisfied}
+              onClick={() => connect(quickConnectWallet[0])}
+            >
+              <span
+                style={{
+                  fontWeight: 700,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                }}
+              >
+                ⚡ Quick connect with {quickConnectWallet[1]}
+                <span className="orbit-wallet-detected-pill">
+                  {DETECTED_BADGE_LABEL}
+                </span>
+              </span>
+              <small style={{ display: "block", color: "var(--orbit-muted)" }}>
+                Detected automatically — connect in one click
+              </small>
+            </button>
+          )}
           {!incomingChannelId && !isMobile && (
             <button
               style={{ ...styles.wallet, borderColor: "var(--orbit-accent)" }}
@@ -2587,16 +2636,37 @@ let hashes;
             </div>
           )}
 
-          {extensionWalletChoices.map(([id, name]) => (
-            <button
-              key={id}
-              style={styles.wallet}
-              disabled={!consentSatisfied}
-              onClick={() => connect(id)}
-            >
-              {name}
-            </button>
-          ))}
+          {prioritizedWalletChoices.map(([id, name]) => {
+            const detected = detectedWalletIds.includes(id);
+            return (
+              <button
+                key={id}
+                data-testid={`wallet-option-${id}`}
+                data-detected={detected ? "true" : undefined}
+                style={
+                  detected
+                    ? {
+                        ...styles.wallet,
+                        borderColor: "var(--orbit-accent)",
+                        background: "rgba(99, 102, 241, 0.06)",
+                      }
+                    : styles.wallet
+                }
+                disabled={!consentSatisfied}
+                onClick={() => connect(id)}
+              >
+                {name}
+                {detected && (
+                  <span
+                    className="orbit-wallet-detected-pill"
+                    data-testid={`wallet-detected-${id}`}
+                  >
+                    {DETECTED_BADGE_LABEL}
+                  </span>
+                )}
+              </button>
+            );
+          })}
 
           {demo && (
             <button
