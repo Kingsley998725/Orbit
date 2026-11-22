@@ -27,6 +27,7 @@ const {
     replayWebhookEvents,
     replayDeadLetter,
     setDeliveryObserver,
+    setEndpointAlertNotifier,
     verifyWebhookEndpoint,
 } = require('./webhooks');
 const { createDeliveryAlertObserver, createEndpointAlertNotifier, registerWebhookAlertRoutes } = require('./webhook-alerts');
@@ -1065,7 +1066,6 @@ app.post('/relay/prepare-pull', authenticateMerchant, relayRateLimit, async (req
         const relayer = getRelayer();
         if (!relayer) return res.status(503).json(RELAYER_NOT_CONFIGURED);
 
-        const context = await loadPullContext(supabase, subscription_id, req.merchant);
         const context = await loadPullContext(supabase, subscription_id, req.merchant);
         if (context.error) return res.status(context.status).json({ error: context.error });
         const { sub, merchant } = context;
@@ -2170,10 +2170,6 @@ app.post('/webhooks/:id/rotate-secret', async (req, res) => {
     res.json({ webhook: data, signing_secret: secret });
 });
 
-<<<<<<< HEAD
-res.json({ webhook: data, signing_secret: secret });
-})
-
 /// @route GET /api/verify/invoice/:invoiceId
 /// @desc Verify invoice cryptographic signature and return settlement details
 /// @access Merchant authenticated
@@ -2220,7 +2216,10 @@ app.get('/api/verify/invoice/:invoiceId', authenticateMerchant, async (req, res)
         });
     } catch (err) {
         console.error('Error verifying invoice:', err);
-=======
+        res.status(500).json({ error: 'Internal server error during invoice verification' });
+    }
+});
+
 app.post('/webhooks/:id/verify', async (req, res) => {
     try {
         const supabase = getSupabase();
@@ -2233,7 +2232,6 @@ app.post('/webhooks/:id/verify', async (req, res) => {
         res.status(result.ok ? 200 : 502).json(result);
     } catch (err) {
         res.status(err.status || 500).json({ error: err.message });
->>>>>>> upstream/main
     }
 });
 

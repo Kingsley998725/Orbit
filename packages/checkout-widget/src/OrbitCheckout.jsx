@@ -80,12 +80,10 @@ import {
   allbridgeUrl,
   watchForBridgedFunds,
 } from "./bridge";
-import {
-  savePendingSession,
-  loadPendingSession,
-  clearPendingSession,
-} from "./pendingSession"; // #265
+import { savePendingSession, loadPendingSession, clearPendingSession } from "./pendingSession"; // #265
 import { createTranslator } from "./i18n"; // #264
+import { parseReferralCode } from "./referral"; // #351
+import { initWalletAccountWatcher, promptWalletAccountSwitch } from "./accountSwitcher"; // #352
 
 const STORAGE_KEY = "orbit:selected-wallet";
 const PENDING_KEY = "orbit:pending-transaction";
@@ -138,8 +136,17 @@ customClasses = {},
   requireConsent = false,
   locale = "", // #264: explicit locale override, e.g. "es"
   hardwareWallet = false, // #267: set true for extended sign timeout + guidance UI
+  referralCode = "", // #351: customizable promotional referral tracking code
 }) {
   const isMobile = useMemo(() => isMobileBrowser(), []);
+
+  // #351 — promotional referral tracking code (autodetect from prop or URL ?ref / ?aff)
+  const activeReferralCode = useMemo(() => {
+    return parseReferralCode({
+      propCode: referralCode,
+      search: typeof window !== "undefined" && window.location ? window.location.search : "",
+    });
+  }, [referralCode]);
 
   // #264 — i18n translator bound to the resolved locale
   const t = useMemo(() => createTranslator(locale), [locale]);
@@ -516,6 +523,32 @@ customClasses = {},
       setSwitchingNetwork(false);
     }
   };
+
+  // #352: Account Change Listener & Inline Re-Authorization
+  const handleAccountChange = (newAddress) => {
+    if (!newAddress || newAddress === address) return;
+    setAddress(newAddress);
+    // Smoothly reset authorization state to allow signing with newly active account
+    setProcessing(false);
+    setConfirming(false);
+    setPending(null);
+    setError("");
+    setReceipt(null);
+    // Immediately re-query USDC balance, spendable assets, and trustline status
+    setBalanceRefreshTick((tick) => tick + 1);
+    dispatch("orbit:wallet_connected", { address: newAddress });
+    dispatch("orbit:account_changed", { previousAddress: address, address: newAddress });
+  };
+
+  useEffect(() => {
+    if (!address || isDemo) return undefined;
+    const watcher = initWalletAccountWatcher({
+      currentAddress: address,
+      onAccountChange: handleAccountChange,
+      onNetworkChange: () => checkNetwork(),
+    });
+    return () => watcher.stop();
+  }, [address, isDemo]);
 
   useEffect(() => {
     if (!walletConnectProjectId) {
@@ -1381,6 +1414,7 @@ let hashes;
       const finalMetadata = {
         ...formData,
         ...(captureEmail && customerEmail.trim() ? { email: customerEmail.trim() } : {}),
+        ...(activeReferralCode ? { referral_code: activeReferralCode, referralCode: activeReferralCode } : {}),
       };
 
       const response = await fetch(`${apiUrl}/subscriptions`, {
@@ -1390,8 +1424,8 @@ let hashes;
           plan_id: plan.id || planId,
           customer_wallet_address: address,
           metadata: finalMetadata,
-          metadata: formData,
           coupon_code: appliedCoupon?.code,
+          referral_code: activeReferralCode || undefined,
         }),
       });
 
@@ -1419,22 +1453,17 @@ let hashes;
       setPending(null);
       setReceipt(hashes);
       const subscriptionEventPayload = {
-        subscriptionId: subscription.id,
-        planId: plan.id || planId,
-        txHash: hashes.vaultHash,
-        metadata: finalMetadata,
-        ...(captureEmail && customerEmail.trim() ? { email: customerEmail.trim() } : {}),
-      };
-      dispatch('orbit:subscribed', subscriptionEventPayload);
-      onSuccess?.(subscriptionEventPayload);
-      dispatch("orbit:subscribed", {
         vaultId: subscription.vault_id || subscription.vaultId || subscription.id,
         subscriptionId: subscription.id,
         planId: plan.id || planId,
         txHash: hashes.vaultHash,
-        metadata: formData,
+        metadata: finalMetadata,
+        referralCode: activeReferralCode || undefined,
         couponCode: appliedCoupon?.code,
-      });
+        ...(captureEmail && customerEmail.trim() ? { email: customerEmail.trim() } : {}),
+      };
+      dispatch('orbit:subscribed', subscriptionEventPayload);
+      onSuccess?.(subscriptionEventPayload);
     } catch (reason) {
       if (reason instanceof PendingTransactionError) {
         setPending({ stage: "transaction", hash: reason.hash });
@@ -1572,6 +1601,26 @@ let hashes;
         {logoUrl && <img src={logoUrl} alt={`${plan.merchants?.name || "Merchant"} logo`} style={{ width: "auto", maxWidth: 160, height: 48, objectFit: "contain", marginBottom: 12 }} />}
         <p style={styles.eyebrow}>{plan.merchants?.name || "Orbit merchant"}</p>
         <h2>{plan.name}</h2>
+        {activeReferralCode && (
+          <div
+            className="orbit-referral-pill"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              marginTop: 6,
+              padding: "4px 10px",
+              fontSize: 12,
+              fontWeight: 500,
+              color: "var(--orbit-accent, #6366f1)",
+              backgroundColor: "rgba(99, 102, 241, 0.08)",
+              border: "1px solid rgba(99, 102, 241, 0.25)",
+              borderRadius: "var(--orbit-radius, 6px)",
+            }}
+          >
+            <span>Referred by: <strong>{activeReferralCode}</strong></span>
+          </div>
+        )}
       </div>
 
       {promoTerms ? (
@@ -2137,42 +2186,60 @@ let hashes;
           </div>
         ) : address ? (
           <>
-            <p>
-              <strong>
-                {isDemo
-                  ? "Demo address"
-                  : isSessionKey
-                    ? "⚡ Smart Wallet Session"
-                    : passkeyAdapter
-                      ? "Passkey account"
-                      : "Wallet"}
-                :
-              </strong>{" "}
-              {address.slice(0, 8)}...{address.slice(-5)}
-            </p>
-            {isDemo && <p role="note">Demo mode never signs transactions or creates a subscription.</p>}
-            {termsUrl || privacyUrl && (
-              <div style={{ marginTop: 12, padding: 12, background: 'var(--orbit-surface)', border: '1px solid var(--orbit-border)', borderRadius: 'var(--orbit-radius)', fontSize: 12 }}>
-                <p style={{ marginBottom: 8, color: 'var(--orbit-text)' }}>
-                  {termsUrl ? <span style={{ color: 'var(--orbit-link)' }} onClick={() => window.open(termsUrl, '_blank') }>Terms of Service</span> : ''}
-                  {privacyUrl ? <span style={{ marginLeft: 12, color: 'var(--orbit-link)' }} onClick={() => window.open(privacyUrl, '_blank') }>Privacy Policy</span> : ''}
-                </p>
-                <label style={{ display: 'block', marginTop: 8, cursor: 'pointer' }}>
-                  <input
-                    type="checkbox"
-                    checked={agreedToTerms}
-                    onChange={(e) => setAgreedToTerms(e.target.checked)}
-                    style={{ transform: 'scale(1.2)', marginRight: 4 }}
-                  />
-                  I agree to the {"terms and conditions"} required to complete the subscription.
-                </label>
-              </div>
-            )}
-            <button
-              className={customClasses.button}
-              style={{ ...styles.button, opacity: isWrongNetwork ? 0.6 : 1, display: agreedToTerms || !termsUrl && !privacyUrl ? 1 : agreedToTerms ? 1 : 0.5 }}
-              disabled={processing || isWrongNetwork || (!agreedToTerms && (termsUrl || privacyUrl))}
-=======
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                flexWrap: "wrap",
+                gap: 8,
+                marginBottom: 8,
+              }}
+            >
+              <p style={{ margin: 0 }}>
+                <strong>
+                  {isDemo
+                    ? "Demo address"
+                    : isSessionKey
+                      ? "⚡ Smart Wallet Session"
+                      : passkeyAdapter
+                        ? "Passkey account"
+                        : "Wallet"}
+                  :
+                </strong>{" "}
+                <span className="orbit-connected-address">
+                  {address.slice(0, 8)}...{address.slice(-5)}
+                </span>
+              </p>
+              {!isDemo && (
+                <button
+                  type="button"
+                  className="orbit-switch-account-btn"
+                  onClick={async () => {
+                    const savedWallet = localStorage.getItem(STORAGE_KEY);
+                    await promptWalletAccountSwitch({
+                      walletId: savedWallet,
+                      onSuccess: handleAccountChange,
+                      onOpenSelector: () => setShowWallets(true),
+                      onError: (errMsg) => setError(errMsg),
+                    });
+                  }}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    color: "var(--orbit-accent, #6366f1)",
+                    fontSize: 12,
+                    fontWeight: 600,
+                    cursor: "pointer",
+                    textDecoration: "underline",
+                    padding: "2px 4px",
+                  }}
+                  aria-label="Switch Account"
+                >
+                  Switch Account
+                </button>
+              )}
+            </div>
             {isSessionKey && (
               <div
                 style={{
@@ -2360,7 +2427,6 @@ let hashes;
                 (!isSwap && !isDemo && (usdcCheckPending || !!usdcCheckError || usdcReadiness?.status !== "ready")) ||
                 (isSwap && (!swapQuote || swapQuoteLoading))
               }
->>>>>>> upstream/main
               onClick={subscribe}
               title={!isSwap && !isDemo ? (usdcCheckError || usdcReadinessMessage(usdcReadiness) || undefined) : undefined}
             >
