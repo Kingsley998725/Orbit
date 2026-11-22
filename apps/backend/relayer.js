@@ -65,26 +65,104 @@ const pullInvocation = (contractId, user, merchant) => new xdr.SorobanAuthorized
 // earlier one is still pending, so the cache only advances when a submission is accepted
 // and is dropped (re-read from the ledger) after a txBadSeq.
 class SequenceManager {
-    constructor(server) {
+    constructor(server, redisClient = null) {
         this.server = server;
+        this.redisClient = redisClient;
         this.sequences = new Map();
     }
 
     // Returns an Account whose next built transaction uses the next free sequence number
     async account(publicKey) {
-        if (!this.sequences.has(publicKey)) {
+        if (this.redisClient) {
+            const sharedSequence = await this.redisClient.get(this.keyFor(publicKey));
+            if (sharedSequence !== null) {
+                this.sequences.set(publicKey, sharedSequence);
+            } else {
+                const onChain = await this.server.getAccount(publicKey);
+                const sequence = onChain.sequenceNumber();
+                await this.redisClient.set(this.keyFor(publicKey), sequence, 'PX', 24 * 60 * 60 * 1000, 'NX');
+                const initializedSequence = await this.redisClient.get(this.keyFor(publicKey));
+                this.sequences.set(publicKey, initializedSequence ?? sequence);
+            }
+        } else if (!this.sequences.has(publicKey)) {
             const onChain = await this.server.getAccount(publicKey);
             this.sequences.set(publicKey, onChain.sequenceNumber());
         }
         return new Account(publicKey, this.sequences.get(publicKey));
     }
 
-    commit(publicKey, usedSequence) {
-        this.sequences.set(publicKey, usedSequence);
+    keyFor(publicKey) {
+        return `orbit:stellar:sequence:${publicKey}`;
     }
 
-    invalidate(publicKey) {
+    async commit(publicKey, usedSequence) {
+        this.sequences.set(publicKey, usedSequence);
+        if (this.redisClient) {
+            await this.redisClient.set(this.keyFor(publicKey), usedSequence, 'PX', 24 * 60 * 60 * 1000);
+        }
+    }
+
+    async invalidate(publicKey) {
         this.sequences.delete(publicKey);
+        if (this.redisClient) await this.redisClient.del(this.keyFor(publicKey));
+    }
+}
+
+const RELEASE_SEQUENCE_LOCK_LUA = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`;
+
+class SourceAccountMutex {
+    constructor(redisClient, { timeoutMs, lockTtlMs = 10 * 60 * 1000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) {
+        this.redisClient = redisClient;
+        this.timeoutMs = timeoutMs;
+        this.lockTtlMs = lockTtlMs;
+        this.sleep = sleep;
+        this.localLocks = new Map();
+    }
+
+    async acquire(publicKey) {
+        const releaseLocal = await this.acquireLocal(publicKey);
+        if (!this.redisClient) return releaseLocal;
+
+        const key = `orbit:stellar:sequence-lock:${publicKey}`;
+        const token = crypto.randomUUID();
+        const deadline = Date.now() + this.timeoutMs;
+        try {
+            while (Date.now() < deadline) {
+                if (await this.redisClient.set(key, token, 'PX', this.lockTtlMs, 'NX') === 'OK') {
+                    return () => {
+                        this.redisClient.eval(RELEASE_SEQUENCE_LOCK_LUA, 1, key, token)
+                            .catch((error) => console.error(`Failed to release sequence lock for ${publicKey}:`, error))
+                            .finally(releaseLocal);
+                    };
+                }
+                await this.sleep(25);
+            }
+            throw new RelayerError('relayer_busy', 503, 'Source account is busy, please retry later', { retryAfter: 5 });
+        } catch (error) {
+            releaseLocal();
+            throw error;
+        }
+    }
+
+    acquireLocal(publicKey) {
+        const state = this.localLocks.get(publicKey);
+        if (!state) {
+            this.localLocks.set(publicKey, { waiters: [] });
+            return Promise.resolve(() => this.releaseLocal(publicKey));
+        }
+        return new Promise((resolve) => state.waiters.push(resolve));
+    }
+
+    releaseLocal(publicKey) {
+        const state = this.localLocks.get(publicKey);
+        const next = state?.waiters.shift();
+        if (next) next(() => this.releaseLocal(publicKey));
+        else this.localLocks.delete(publicKey);
     }
 }
 
@@ -185,11 +263,17 @@ const createRelayer = ({
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     feeEstimator = null,
     sponsorshipPolicy = null,
+    redisClient = null,
     options = {},
 }) => {
     const opts = { ...DEFAULTS, ...options };
     const pool = new ChannelPool(channels, { queueTimeoutMs: opts.queueTimeoutMs });
-    const sequences = new SequenceManager(server);
+    const sequences = new SequenceManager(server, redisClient);
+    const sourceAccountMutex = new SourceAccountMutex(redisClient, {
+        timeoutMs: opts.queueTimeoutMs,
+        lockTtlMs: opts.distributedSequenceLockTtlMs,
+        sleep,
+    });
 
     const buildInner = (account, user, merchant, auth) =>
         new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase })
@@ -265,8 +349,10 @@ const createRelayer = ({
         const channel = await pool.acquire();
         let reservation = null;
         let submitted = null;
+        let releaseSourceAccount;
 
         try {
+            releaseSourceAccount = await sourceAccountMutex.acquire(channel.publicKey());
             for (let attempt = 1; ; attempt += 1) {
                 const account = await sequences.account(channel.publicKey());
                 let prepared;
@@ -301,14 +387,14 @@ const createRelayer = ({
                     response = await server.sendTransaction(activeFeeBump);
                 } catch (err) {
                     // Unknown whether it was accepted: re-read the sequence next time and keep the booking
-                    sequences.invalidate(channel.publicKey());
+                    await sequences.invalidate(channel.publicKey());
                     reservation = null;
                     throw err;
                 }
 
                 if (response.status === 'PENDING' || response.status === 'DUPLICATE') {
-                    sequences.commit(channel.publicKey(), prepared.sequence);
                     submitted = { hash: response.hash, attempts: attempt, innerTransaction: prepared, fee };
+                    await sequences.commit(channel.publicKey(), prepared.sequence);
                     if (onSubmitted) await onSubmitted({ txHash: submitted.hash, attempts: attempt });
                     break;
                 }
@@ -317,7 +403,7 @@ const createRelayer = ({
                 if (response.status !== 'TRY_AGAIN_LATER' && code !== 'txBadSeq') {
                     throw new RelayerError('submission_rejected', 502, `Relayer submission rejected: ${code ?? response.status}`);
                 }
-                if (code === 'txBadSeq') sequences.invalidate(channel.publicKey());
+                if (code === 'txBadSeq') await sequences.invalidate(channel.publicKey());
                 logger.warn(`Relayer retrying pull after ${code ?? response.status} (attempt ${attempt}/${opts.maxAttempts})`);
 
                 if (attempt >= opts.maxAttempts) {
@@ -326,6 +412,8 @@ const createRelayer = ({
                 await sleep(opts.retryDelayMs * attempt);
             }
 
+            releaseSourceAccount?.();
+            releaseSourceAccount = null;
             const firstLedger = (await server.getLatestLedger()).sequence;
             let confirmation = await confirm(server, submitted.hash);
             // Fee escalation replaces only the outer fee-paying envelope. The exact signed
@@ -365,6 +453,7 @@ const createRelayer = ({
             if (reservation && !submitted) await adjustBudget(merchantId, reservation, -reservation.amount, 0);
             throw err;
         } finally {
+            releaseSourceAccount?.();
             pool.release(channel);
         }
     };
@@ -474,7 +563,7 @@ const createRelayer = ({
 };
 
 // Builds the relayer from RELAYER_* env vars; returns null when no relayer key is configured
-const createRelayerFromEnv = ({ server, getSupabase, feeEstimator, env = process.env }) => {
+const createRelayerFromEnv = ({ server, getSupabase, feeEstimator, redisClient = null, env = process.env }) => {
     if (!env.RELAYER_SECRET_KEY || !env.ORBIT_CONTRACT_ID) return null;
 
     const envNumber = (name) => (env[name] ? Number(env[name]) : undefined);
@@ -485,6 +574,7 @@ const createRelayerFromEnv = ({ server, getSupabase, feeEstimator, env = process
         queueTimeoutMs: envNumber('RELAYER_QUEUE_TIMEOUT_MS'),
         authValidityLedgers: envNumber('RELAYER_AUTH_VALIDITY_LEDGERS'),
         maxBaseFeeStroops: envNumber('RELAYER_MAX_BASE_FEE_STROOPS'),
+        distributedSequenceLockTtlMs: envNumber('RELAYER_SEQUENCE_LOCK_TTL_MS'),
     }).filter(([, value]) => value !== undefined));
 
     const sponsor = Keypair.fromSecret(env.RELAYER_SECRET_KEY);
@@ -508,6 +598,7 @@ const createRelayerFromEnv = ({ server, getSupabase, feeEstimator, env = process
             dailyLimitStroops: envNumber('RELAYER_DAILY_FEE_LIMIT_STROOPS') ?? DEFAULTS.dailyFeeLimitStroops,
         }),
         feeEstimator,
+        redisClient,
         options,
     });
 };

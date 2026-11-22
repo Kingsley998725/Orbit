@@ -999,11 +999,12 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON contract_state_snapshots TO service_role
 
 -- 11. Webhook Incident Alert Channels (#189)
 -- Per-merchant destinations for endpoint incident and recovery alerts.
--- config holds { webhook_url } for slack, { routing_key } for pagerduty, { email } for email.
+-- config holds destination-specific settings, including Discord webhook URLs
+-- and Telegram chat IDs for automated delivery-failure alerts.
 CREATE TABLE IF NOT EXISTS webhook_alert_channels (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
-    type VARCHAR(20) NOT NULL CHECK (type IN ('slack', 'pagerduty', 'email')),
+    type VARCHAR(20) NOT NULL CHECK (type IN ('slack', 'pagerduty', 'email', 'discord', 'telegram')),
     config JSONB NOT NULL,
     active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()

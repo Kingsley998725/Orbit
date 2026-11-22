@@ -3,11 +3,13 @@ const { z } = require('zod');
 
 // Rolling window used for the per-endpoint failure rate (15 minutes).
 const FAILURE_WINDOW_MS = 15 * 60 * 1000;
+const MERCHANT_ALERT_THROTTLE_MS = 15 * 60 * 1000;
 // Opens an incident once this many outages happen back to back on one endpoint.
 const CONSECUTIVE_FAILURE_THRESHOLD = 5;
 const PAGERDUTY_EVENTS_URL = 'https://events.pagerduty.com/v2/enqueue';
+const lastMerchantAlertAt = new Map();
 
-const ALERT_CHANNEL_TYPES = ['slack', 'pagerduty', 'email'];
+const ALERT_CHANNEL_TYPES = ['slack', 'pagerduty', 'email', 'discord', 'telegram'];
 
 const alertChannelSchema = z.discriminatedUnion('type', [
     z.object({
@@ -26,6 +28,24 @@ const alertChannelSchema = z.discriminatedUnion('type', [
         type: z.literal('email'),
         config: z.object({
             email: z.string().email('email must be a valid address'),
+        }),
+    }),
+    z.object({
+        type: z.literal('discord'),
+        config: z.object({
+            webhook_url: z.string().url().refine(
+                (url) => /^https:\/\/(discord\.com|discordapp\.com)\/api\/webhooks\//.test(url),
+                'webhook_url must be a Discord webhook URL',
+            ),
+        }),
+    }),
+    z.object({
+        type: z.literal('telegram'),
+        config: z.object({
+            chat_id: z.union([
+                z.string().min(1).max(128),
+                z.number().int().transform(String),
+            ]),
         }),
     }),
 ]);
@@ -129,6 +149,37 @@ const dlqInspectorUrl = (deliveryId, baseUrl = process.env.FRONTEND_URL || 'http
     return deliveryId ? `${base}&delivery=${encodeURIComponent(deliveryId)}` : base;
 };
 
+const HTTP_STATUS_TEXT = Object.freeze({
+    200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content',
+    301: 'Moved Permanently', 400: 'Bad Request', 401: 'Unauthorized',
+    403: 'Forbidden', 404: 'Not Found', 408: 'Request Timeout',
+    409: 'Conflict', 422: 'Unprocessable Entity', 429: 'Too Many Requests',
+    500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable',
+    504: 'Gateway Timeout',
+});
+
+const formatHttpStatus = (status) => {
+    if (!status) return 'Connection failure';
+    return `HTTP ${status} ${HTTP_STATUS_TEXT[status] || 'Error'}`;
+};
+
+const claimMerchantAlertSlot = async (merchantId, { throttleStore, now }) => {
+    const key = `webhook-alert-throttle:${merchantId}`;
+    if (throttleStore) {
+        return throttleStore.set(key, '1', MERCHANT_ALERT_THROTTLE_MS, { onlyIfAbsent: true });
+    }
+    const lastSentAt = lastMerchantAlertAt.get(key);
+    const currentTime = now();
+    for (const [merchantKey, sentAt] of lastMerchantAlertAt) {
+        if (currentTime - sentAt >= MERCHANT_ALERT_THROTTLE_MS) lastMerchantAlertAt.delete(merchantKey);
+    }
+    if (lastSentAt !== undefined && currentTime - lastSentAt < MERCHANT_ALERT_THROTTLE_MS) {
+        return false;
+    }
+    lastMerchantAlertAt.set(key, currentTime);
+    return true;
+};
+
 /**
  * Builds the channel-agnostic incident payload used by every dispatcher.
  */
@@ -144,6 +195,7 @@ const buildIncidentAlert = (transition, { frontendUrl } = {}) => {
         endpoint_url: incident.url,
         failed_event_type: incident.eventType,
         error_code: incident.errorCode,
+        response_status: formatHttpStatus(incident.errorCode),
         consecutive_failures: incident.consecutiveFailures ?? null,
         failure_rate: incident.failureRate ?? null,
         opened_at: incident.openedAt,
@@ -169,7 +221,7 @@ const formatSlack = (alert) => {
     return {
         text: `${alert.title}`,
         blocks: [
-            { type: 'section', text: { type: 'mrkdwn', text: `${headline}\n*Endpoint:* ${alert.endpoint_url}\n*Failed event:* ${alert.failed_event_type}\n*Error code:* ${alert.error_code}` } },
+            { type: 'section', text: { type: 'mrkdwn', text: `${headline}\n*Endpoint:* ${alert.endpoint_url}\n*Failed event:* ${alert.failed_event_type}\n*Latest response:* ${alert.response_status}` } },
             { type: 'section', text: { type: 'mrkdwn', text: `<${alert.dlq_url}|Inspect in the dead-letter queue>` } },
         ],
     };
@@ -197,8 +249,44 @@ const dispatchers = {
                     endpoint_url: alert.endpoint_url,
                     failed_event_type: alert.failed_event_type,
                     error_code: alert.error_code,
+                    response_status: alert.response_status,
                     dlq_url: alert.dlq_url,
                 },
+            },
+        });
+    },
+    discord: async (channel, alert, { fetchImpl }) => {
+        await postJson(fetchImpl, channel.config.webhook_url, {
+            embeds: [{
+                title: alert.action === 'resolved' ? 'Webhook delivery restored' : 'Webhook delivery alert',
+                color: alert.action === 'resolved' ? 0x2ecc71 : 0xe74c3c,
+                fields: [
+                    { name: 'Event type', value: alert.failed_event_type || 'unknown', inline: true },
+                    { name: 'Latest response', value: alert.response_status || formatHttpStatus(alert.error_code), inline: true },
+                    { name: 'Target URL', value: alert.endpoint_url || 'unknown' },
+                ],
+                url: alert.dlq_url,
+                timestamp: alert.opened_at,
+            }],
+        });
+    },
+    telegram: async (channel, alert, { fetchImpl, telegramBotToken }) => {
+        if (!telegramBotToken) throw new Error('TELEGRAM_BOT_TOKEN is not configured');
+        const url = `https://api.telegram.org/bot${telegramBotToken}/sendMessage`;
+        const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+        })[char]);
+        await postJson(fetchImpl, url, {
+            chat_id: channel.config.chat_id,
+            parse_mode: 'HTML',
+            text: [
+                `<b>${alert.action === 'resolved' ? 'Webhook delivery restored' : 'Webhook delivery alert'}</b>`,
+                `<b>Event:</b> ${escapeHtml(alert.failed_event_type || 'unknown')}`,
+                `<b>Target:</b> ${escapeHtml(alert.endpoint_url || 'unknown')}`,
+                `<b>Latest response:</b> ${escapeHtml(alert.response_status || formatHttpStatus(alert.error_code))}`,
+            ].join('\n'),
+            reply_markup: {
+                inline_keyboard: [[{ text: 'Replay in dashboard', url: alert.dlq_url }]],
             },
         });
     },
@@ -210,7 +298,7 @@ const dispatchers = {
             text: [
                 `Endpoint: ${alert.endpoint_url}`,
                 `Failed event: ${alert.failed_event_type}`,
-                `Error code: ${alert.error_code}`,
+                `Latest response: ${alert.response_status}`,
                 `Dead-letter queue: ${alert.dlq_url}`,
             ].join('\n'),
         });
@@ -224,11 +312,12 @@ const dispatchers = {
 const dispatchIncidentAlert = async (channel, alert, {
     fetchImpl = globalThis.fetch,
     emailRelayUrl = process.env.ALERT_EMAIL_RELAY_URL,
+    telegramBotToken = process.env.TELEGRAM_BOT_TOKEN,
 } = {}) => {
     const send = dispatchers[channel.type];
     if (!send) return { channel_id: channel.id, ok: false, error: `unsupported channel type ${channel.type}` };
     try {
-        await send(channel, alert, { fetchImpl, emailRelayUrl });
+        await send(channel, alert, { fetchImpl, emailRelayUrl, telegramBotToken });
         return { channel_id: channel.id, ok: true };
     } catch (err) {
         return { channel_id: channel.id, ok: false, error: err.message };
@@ -244,9 +333,11 @@ const createDeliveryAlertObserver = (getSupabase, {
     tracker = createIncidentTracker(),
     fetchImpl = globalThis.fetch,
     emailRelayUrl,
+    telegramBotToken,
     frontendUrl,
     now = () => Date.now(),
-} = {}) => async ({ merchantId, webhook, eventType, responseStatus, deliveryId }) => {
+    throttleStore,
+} = {}) => async ({ merchantId, webhook, eventType, responseStatus, deliveryId, deadLettered = false }) => {
     const transition = tracker.record(webhook.id, {
         url: webhook.url,
         eventType,
@@ -254,7 +345,7 @@ const createDeliveryAlertObserver = (getSupabase, {
         deliveryId,
         now: now(),
     });
-    if (!transition) return [];
+    if (!transition && !deadLettered) return [];
 
     const supabase = getSupabase();
     if (!supabase || !merchantId) return [];
@@ -264,10 +355,26 @@ const createDeliveryAlertObserver = (getSupabase, {
         .select('*')
         .eq('merchant_id', merchantId)
         .eq('active', true);
-    if (error || !channels) return [];
+    if (error) throw error;
+    if (!channels?.length) return [];
+    const shouldSend = await claimMerchantAlertSlot(merchantId, { throttleStore, now });
+    if (!shouldSend) return [];
 
-    const alert = buildIncidentAlert(transition, { frontendUrl });
-    return Promise.all(channels.map((channel) => dispatchIncidentAlert(channel, alert, { fetchImpl, emailRelayUrl })));
+    const alertTransition = transition || {
+        type: 'incident_opened',
+        incident: {
+            id: crypto.randomUUID(),
+            url: webhook.url,
+            eventType,
+            errorCode: responseStatus,
+            deliveryId,
+            openedAt: new Date(now()).toISOString(),
+        },
+    };
+    const alert = buildIncidentAlert(alertTransition, { frontendUrl });
+    return Promise.all(channels.map((channel) => dispatchIncidentAlert(
+        channel, alert, { fetchImpl, emailRelayUrl, telegramBotToken },
+    )));
 };
 
 const registerWebhookAlertRoutes = (app, getSupabase, authenticateMerchant) => {
@@ -318,7 +425,9 @@ const registerWebhookAlertRoutes = (app, getSupabase, authenticateMerchant) => {
 const createEndpointAlertNotifier = (getSupabase, {
   fetchImpl = globalThis.fetch,
   emailRelayUrl,
+  telegramBotToken,
   frontendUrl,
+  throttleStore,
 } = {}) => async ({ url, lastStatusCode }) => {
   const supabase = getSupabase();
   if (!supabase) return [];
@@ -329,16 +438,18 @@ const createEndpointAlertNotifier = (getSupabase, {
     .eq('url', url)
     .eq('active', true)
     .limit(1);
-  if (whErr || !webhooks || webhooks.length === 0) return [];
+  if (whErr) throw whErr;
+  if (!webhooks?.length) return [];
 
   const { merchant_id: merchantId } = webhooks[0];
-
   const { data: channels, error: chErr } = await supabase
     .from('webhook_alert_channels')
     .select('*')
     .eq('merchant_id', merchantId)
     .eq('active', true);
-  if (chErr || !channels || channels.length === 0) return [];
+  if (chErr) throw chErr;
+  if (!channels?.length) return [];
+  if (!await claimMerchantAlertSlot(merchantId, { throttleStore, now: Date.now })) return [];
 
   const alert = {
     action: 'triggered',
@@ -347,6 +458,7 @@ const createEndpointAlertNotifier = (getSupabase, {
     endpoint_url: url,
     failed_event_type: 'webhook.endpoint',
     error_code: lastStatusCode,
+    response_status: formatHttpStatus(lastStatusCode),
     consecutive_failures: null,
     failure_rate: null,
     opened_at: new Date().toISOString(),
@@ -356,13 +468,14 @@ const createEndpointAlertNotifier = (getSupabase, {
 
   return Promise.all(
     channels.map((channel) =>
-      dispatchIncidentAlert(channel, alert, { fetchImpl, emailRelayUrl }),
+      dispatchIncidentAlert(channel, alert, { fetchImpl, emailRelayUrl, telegramBotToken }),
     ),
   );
 };
 
 module.exports = {
     FAILURE_WINDOW_MS,
+    MERCHANT_ALERT_THROTTLE_MS,
     CONSECUTIVE_FAILURE_THRESHOLD,
     ALERT_CHANNEL_TYPES,
     alertChannelSchema,

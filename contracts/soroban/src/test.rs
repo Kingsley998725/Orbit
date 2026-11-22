@@ -837,6 +837,58 @@ fn test_cancel_vault_removes_vault_and_blocks_pull() {
 }
 
 #[test]
+fn test_early_cancellation_charges_agreed_fee_before_removing_vault() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&user, &100);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&user, &contract_id, &100, &2_000_000);
+    orbit.create_vault(&user, &merchant, &token, &10, &100);
+    orbit.configure_cancellation_terms(&user, &merchant, &10, &5);
+
+    orbit.cancel_vault(&user, &merchant);
+
+    assert_eq!(token_client.balance(&merchant), 5);
+    assert_eq!(token_client.balance(&user), 95);
+    assert_eq!(orbit.get_vault(&user, &merchant), None);
+}
+
+#[test]
+fn test_cancellation_after_commitment_has_no_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&user, &100);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&user, &contract_id, &100, &2_000_000);
+    orbit.create_vault(&user, &merchant, &token, &10, &100);
+    orbit.configure_cancellation_terms(&user, &merchant, &10, &5);
+    env.ledger().set_sequence_number(10);
+
+    orbit.cancel_vault(&user, &merchant);
+
+    assert_eq!(token_client.balance(&merchant), 0);
+    assert_eq!(token_client.balance(&user), 100);
+}
+
+#[test]
 fn test_cancel_vault_fails_when_vault_does_not_exist() {
     let env = Env::default();
     env.mock_all_auths();
@@ -4516,6 +4568,49 @@ fn test_pull_without_stake_charges_full_amount() {
     orbit.create_vault(&user, &merchant, &token, &10, &100);
     orbit.pull_funds(&user, &merchant);
     assert_eq!(token_client.balance(&merchant), 10);
+}
+
+#[test]
+fn test_recurring_loyalty_discount_unlocks_after_completed_cycles() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = TokenClient::new(&env, &token);
+    StellarAssetClient::new(&env, &token).mint(&user, &1_000);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    token_client.approve(&user, &contract_id, &1_000, &2_000_000);
+    orbit.create_vault(&user, &merchant, &token, &100, &100);
+    orbit.configure_vault_loyalty_schedule(
+        &user,
+        &merchant,
+        &soroban_sdk::vec![
+            &env,
+            LoyaltyDiscountTier {
+                cycle_count: 2,
+                discount_bps: 500,
+            },
+        ],
+    );
+
+    env.ledger().set_timestamp(1_000);
+    orbit.pull_funds(&user, &merchant);
+    env.ledger().set_timestamp(1_100);
+    orbit.pull_funds(&user, &merchant);
+    env.ledger().set_timestamp(1_200);
+    orbit.pull_funds(&user, &merchant);
+
+    assert_eq!(token_client.balance(&merchant), 295);
+    assert_eq!(
+        orbit.get_vault(&user, &merchant).unwrap().settled_cycle_count,
+        3
+    );
 }
 
 #[test]

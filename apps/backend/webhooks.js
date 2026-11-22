@@ -245,11 +245,16 @@ const scheduleWebhookRetry = ({
           .from("webhook_deliveries")
           .update({ status: "dead_lettered", next_retry_at: null })
           .eq("id", deliveryId);
-        await moveToDeadLetterQueue(supabase, {
+        const archived = await moveToDeadLetterQueue(supabase, {
           deliveryId, webhook, merchantId, eventType, payload,
           attemptCount: failedAttempt, responseStatus: null,
           responseBody: "Endpoint paused by circuit breaker",
         });
+        if (archived) {
+          notifyDeliveryObserver({
+            merchantId, webhook, eventType, responseStatus: null, deliveryId, deadLettered: true,
+          });
+        }
         return;
       }
       const headers = signedDeliveryHeaders({
@@ -279,16 +284,8 @@ const scheduleWebhookRetry = ({
         })
         .eq("id", deliveryId);
 
-      notifyDeliveryObserver({
-        merchantId,
-        webhook,
-        eventType,
-        responseStatus: result.responseStatus,
-        deliveryId,
-      });
-
       if (exhausted) {
-        await moveToDeadLetterQueue(supabase, {
+        const archived = await moveToDeadLetterQueue(supabase, {
           deliveryId,
           webhook,
           merchantId,
@@ -298,10 +295,27 @@ const scheduleWebhookRetry = ({
           responseStatus: result.responseStatus,
           responseBody: result.responseBody,
         });
+        notifyDeliveryObserver({
+          merchantId,
+          webhook,
+          eventType,
+          responseStatus: result.responseStatus,
+          deliveryId,
+          deadLettered: archived,
+        });
       } else if (!result.ok) {
+        notifyDeliveryObserver({
+          merchantId, webhook, eventType,
+          responseStatus: result.responseStatus, deliveryId,
+        });
         scheduleWebhookRetry({
           supabase, webhook, merchantId, eventType, payload, payloadString,
           deliveryId, failedAttempt: attempt, fetchImpl, retry,
+        });
+      } else {
+        notifyDeliveryObserver({
+          merchantId, webhook, eventType,
+          responseStatus: result.responseStatus, deliveryId,
         });
       }
     } catch (err) {
@@ -336,9 +350,10 @@ const moveToDeadLetterQueue = async (supabase, {
   ]);
   if (error) {
     console.error(`Failed to archive webhook delivery ${deliveryId} in the dead-letter queue:`, error);
-    return;
+    return false;
   }
   recordWebhookDelivery("dead_lettered");
+  return true;
 };
 
 /**
@@ -446,11 +461,16 @@ const dispatchWebhookEvent = async (
       const webhook = { ...wh, signing_secret: wh.signing_secret || generateSigningSecret() };
       const deliveryId = crypto.randomUUID();
       if (endpointBreaker.status(wh.url) === ENDPOINT_STATUS.PAUSED) {
-        await moveToDeadLetterQueue(supabase, {
+        const archived = await moveToDeadLetterQueue(supabase, {
           deliveryId, webhook, merchantId, eventType, payload,
           attemptCount: 0, responseStatus: null,
           responseBody: "Endpoint paused by circuit breaker",
         });
+        if (archived) {
+          notifyDeliveryObserver({
+            merchantId, webhook, eventType, responseStatus: null, deliveryId, deadLettered: true,
+          });
+        }
         continue;
       }
       const headers = signedDeliveryHeaders({
@@ -496,19 +516,14 @@ const dispatchWebhookEvent = async (
         .select()
         .single();
 
-      notifyDeliveryObserver({
-        merchantId,
-        webhook: wh,
-        eventType,
-        responseStatus,
-        deliveryId,
-      });
-
       if (!deliveryErr && deliveryRecord) {
         deliveries.push(deliveryRecord);
       }
 
       if (willRetry) {
+        notifyDeliveryObserver({
+          merchantId, webhook: wh, eventType, responseStatus, deliveryId,
+        });
         scheduleWebhookRetry({
           supabase,
           webhook,
@@ -522,9 +537,16 @@ const dispatchWebhookEvent = async (
           retry: retryConfig,
         });
       } else if (!ok) {
-        await moveToDeadLetterQueue(supabase, {
+        const archived = await moveToDeadLetterQueue(supabase, {
           deliveryId, webhook, merchantId, eventType, payload,
           attemptCount: 1, responseStatus, responseBody,
+        });
+        notifyDeliveryObserver({
+          merchantId, webhook: wh, eventType, responseStatus, deliveryId, deadLettered: archived,
+        });
+      } else {
+        notifyDeliveryObserver({
+          merchantId, webhook: wh, eventType, responseStatus, deliveryId,
         });
       }
     }

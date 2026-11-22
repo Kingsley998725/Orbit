@@ -11,7 +11,26 @@
         { "name": "interval_seconds", "type": "u64" },
         { "name": "last_pull_timestamp", "type": "u64" },
         { "name": "grace_period_seconds", "type": "u64" },
-        { "name": "payment_status", "type": "u32" }
+        { "name": "payment_status", "type": "u32" },
+        { "name": "initial_timestamp", "type": "u64" },
+        { "name": "pull_sequence", "type": "u64" },
+        { "name": "is_paused", "type": "bool" },
+        { "name": "trial_end_timestamp", "type": "u64" },
+        { "name": "setup_fee", "type": "i128" },
+        { "name": "expiration_ledger", "type": "u32" },
+        { "name": "lifetime_cap_amount", "type": "i128" },
+        { "name": "total_pulled_amount", "type": "i128" },
+        { "name": "created_ledger", "type": "u32" },
+        { "name": "min_commitment_ledgers", "type": "u64" },
+        { "name": "early_cancellation_fee", "type": "i128" },
+        { "name": "settled_cycle_count", "type": "u32" },
+        { "name": "loyalty_discount_schedule", "type": "vec<LoyaltyDiscountTier>" }
+      ]
+    },
+    "LoyaltyDiscountTier": {
+      "fields": [
+        { "name": "cycle_count", "type": "u32" },
+        { "name": "discount_bps", "type": "u32" }
       ]
     },
     "PaymentSplit": {
@@ -124,6 +143,27 @@
       "inputs": [
         { "name": "merchant", "type": "address" },
         { "name": "user", "type": "address" }
+      ],
+      "output": null
+    },
+    {
+      "name": "configure_cancellation_terms",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" },
+        { "name": "min_commitment_ledgers", "type": "u64" },
+        { "name": "early_cancellation_fee", "type": "i128" }
+      ],
+      "output": null
+    },
+    {
+      "name": "configure_vault_loyalty_schedule",
+      "mutating": true,
+      "inputs": [
+        { "name": "user", "type": "address" },
+        { "name": "merchant", "type": "address" },
+        { "name": "tiers", "type": "vec<LoyaltyDiscountTier>" }
       ],
       "output": null
     },

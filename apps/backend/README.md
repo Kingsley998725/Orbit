@@ -36,7 +36,7 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `API_KEY_RATE_LIMIT_MAX` | Legacy name for the free tier quota, used when `API_KEY_FREE_TIER_LIMIT` is unset | `60` |
 | `IP_RATE_LIMIT_MAX` | Requests per window allowed for each client IP on every route (defaults to 300) | `300` |
 | `TRUST_PROXY` | Express `trust proxy` setting; set when behind a load balancer so rate limiting sees the client IP | `1` |
-| `REDIS_URL` | Redis shared by all API instances for rate limits and reputation; unset keeps them in memory per process | `redis://localhost:6379` |
+| `REDIS_URL` | Redis shared by all API instances for rate limits, reputation, webhook alert throttling, and relayer sequence locks; unset keeps coordination in memory per process | `redis://localhost:6379` |
 | `REDIS_COMMAND_TIMEOUT_MS` | Redis command timeout before a request falls back to in-memory limits (defaults to 250) | `250` |
 | `RATE_LIMIT_REDIS_RETRY_MS` | How long to stay on the in-memory fallback after a Redis failure (defaults to 5000) | `5000` |
 | `RATE_LIMIT_REDIS_PREFIX` | Key prefix for rate limit data in Redis (defaults to `orbit:rl:`) | `orbit:rl:` |
@@ -69,6 +69,8 @@ Copy `apps/backend/.env.example` to `apps/backend/.env` and configure:
 | `METRICS_TOKEN` | Bearer token required by `GET /metrics`; when unset the endpoint answers 403 | `a-long-random-token` |
 | `WEBHOOK_MAX_ATTEMPTS` | Delivery attempts before a webhook goes to the dead-letter queue (defaults to 5) | `5` |
 | `WEBHOOK_RETRY_BASE_MS` / `WEBHOOK_RETRY_MAX_MS` | Base and maximum retry backoff; delays double per attempt with jitter (defaults to 30000 / 1800000) | `30000` |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token used for configured webhook-failure alert channels | `123456:bot-token` |
+| `RELAYER_SEQUENCE_LOCK_TTL_MS` | Redis lease duration for serializing submissions from a source account (defaults to 600000) | `600000` |
 | `DEV_FRIENDBOT_URL` | Friendbot used by `POST /api/dev/fund` (defaults to the public testnet Friendbot) | `https://friendbot.stellar.org` |
 | `DEV_FUND_HORIZON_URL` | Horizon used for the dev USDC trustline (defaults to `HORIZON_URL`, else testnet Horizon) | `https://horizon-testnet.stellar.org` |
 | `DEV_USDC_ISSUER` | USDC issuer the dev trustline points at (defaults to Circle's testnet issuer) | `GBBD47...LFLA5` |
@@ -1060,6 +1062,8 @@ X-Orbit-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256(secret, "<t>.<raw body>"
 Verify it against the **raw** request body, and reject timestamps more than 5 minutes from your clock to block replays. During a secret rotation, accept either the current or the previous secret. `X-Orbit-Delivery` identifies the delivery and `X-Orbit-Attempt` the attempt number.
 
 A delivery fails on a non-2xx response, a network error or a 6-second timeout. Failed deliveries are retried in the background, so dispatching never waits on a slow endpoint. There are up to `WEBHOOK_MAX_ATTEMPTS` attempts (default 5) with jittered exponential backoff: the delay doubles from `WEBHOOK_RETRY_BASE_MS`, capped at `WEBHOOK_RETRY_MAX_MS`, and is randomized between 50% and 100% of that value. The delivery's `status` is `retrying` with `next_retry_at` until it succeeds or attempts run out. It then becomes `dead_lettered` and is archived in `webhook_dead_letters`. Merchants can list those with `GET /webhooks/dead-letters` and re-send one with `POST /webhooks/dead-letters/:id/replay`.
+
+Merchants can manage incident destinations with `GET`, `POST`, and `DELETE /webhook-alert-channels`. Discord channels store a Discord webhook URL; Telegram channels store a chat ID and use the server's `TELEGRAM_BOT_TOKEN`. Failure alerts include the event type, endpoint, latest HTTP status, and a dashboard link to inspect or replay the delivery. Alerts are throttled to one per merchant every 15 minutes. When `REDIS_URL` is configured, both this throttle and relayer source-account locks are shared across API instances.
 
 ## Metrics
 

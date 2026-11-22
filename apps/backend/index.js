@@ -216,6 +216,7 @@ const getRelayer = () => {
             server: getSorobanServer(process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org'),
             getSupabase,
             feeEstimator,
+            redisClient: rateLimitStore.client || null,
         });
     }
     return defaultRelayer;
@@ -2286,8 +2287,8 @@ registerWebhookAlertRoutes(app, getSupabase, authenticateMerchant);
 
 // Dunning workflow builder: saved retry cadence, email templates and recovery funnel (#190)
 registerDunningWorkflowRoutes(app, getSupabase, authenticateMerchant);
-setDeliveryObserver(createDeliveryAlertObserver(getSupabase));
-setEndpointAlertNotifier(createEndpointAlertNotifier(getSupabase));
+setDeliveryObserver(createDeliveryAlertObserver(getSupabase, { throttleStore: rateLimitStore }));
+setEndpointAlertNotifier(createEndpointAlertNotifier(getSupabase, { throttleStore: rateLimitStore }));
 registerCustomerPortalRoutes(app, getSupabase, getSorobanServer);
 registerFailureRecoveryRoutes(app, getSupabase, authenticateMerchant);
 registerCouponRoutes(app, getSupabase, authenticateMerchant);
