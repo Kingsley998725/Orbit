@@ -105,6 +105,10 @@ describe('alert payload and destinations', () => {
     const alert = { action: 'triggered', incident_id: 'inc-1', title: 't', endpoint_url: ENDPOINT.url, failed_event_type: 'x', error_code: 500, dlq_url: 'u' };
 
     await dispatchIncidentAlert({ id: 's', type: 'slack', config: { webhook_url: 'https://hooks.slack.com/services/T/B/X' } }, alert, { fetchImpl });
+    await dispatchIncidentAlert({ id: 'd', type: 'discord', config: { webhook_url: 'https://discord.com/api/webhooks/1/token' } }, alert, { fetchImpl });
+    await dispatchIncidentAlert({ id: 't', type: 'telegram', config: { chat_id: '-100123' } }, alert, {
+      fetchImpl, telegramBotToken: 'bot-token',
+    });
     await dispatchIncidentAlert({ id: 'p', type: 'pagerduty', config: { routing_key: 'R'.repeat(32) } }, alert, { fetchImpl });
     await dispatchIncidentAlert({ id: 'p2', type: 'pagerduty', config: { routing_key: 'R'.repeat(32) } }, { ...alert, action: 'resolved' }, { fetchImpl });
     const emailResult = await dispatchIncidentAlert({ id: 'e', type: 'email', config: { email: 'ops@merchant.example' } }, alert, { fetchImpl, emailRelayUrl: 'https://relay.example/send' });
@@ -112,11 +116,15 @@ describe('alert payload and destinations', () => {
     expect(emailResult.ok).toBe(true);
     const bodies = fetchImpl.mock.calls.map(([url, init]) => [url, JSON.parse(init.body)]);
     expect(bodies[0][0]).toBe('https://hooks.slack.com/services/T/B/X');
-    expect(bodies[1][1].event_action).toBe('trigger');
-    expect(bodies[1][1].dedup_key).toBe('inc-1');
-    expect(bodies[2][1].event_action).toBe('resolve');
-    expect(bodies[2][1].payload).toBeUndefined();
-    expect(bodies[3][0]).toBe('https://relay.example/send');
+    expect(bodies[1][1].embeds[0].fields[1].value).toBe('HTTP 500 Internal Server Error');
+    expect(bodies[1][1].embeds[0].url).toBe('u');
+    expect(bodies[2][0]).toBe('https://api.telegram.org/botbot-token/sendMessage');
+    expect(bodies[2][1].reply_markup.inline_keyboard[0][0].url).toBe('u');
+    expect(bodies[3][1].event_action).toBe('trigger');
+    expect(bodies[3][1].dedup_key).toBe('inc-1');
+    expect(bodies[4][1].event_action).toBe('resolve');
+    expect(bodies[4][1].payload).toBeUndefined();
+    expect(bodies[5][0]).toBe('https://relay.example/send');
   });
 
   it('reports a failing destination without throwing', async () => {
@@ -129,11 +137,13 @@ describe('alert payload and destinations', () => {
     expect(alertChannelSchema.safeParse({ type: 'slack', config: { webhook_url: 'https://example.com/x' } }).success).toBe(false);
     expect(alertChannelSchema.safeParse({ type: 'pagerduty', config: { routing_key: 'short' } }).success).toBe(false);
     expect(alertChannelSchema.safeParse({ type: 'email', config: { email: 'ops@merchant.example' } }).success).toBe(true);
+    expect(alertChannelSchema.safeParse({ type: 'discord', config: { webhook_url: 'https://discord.com/api/webhooks/1/token' } }).success).toBe(true);
+    expect(alertChannelSchema.safeParse({ type: 'telegram', config: { chat_id: '-100123' } }).success).toBe(true);
   });
 });
 
 describe('delivery observer', () => {
-  it('sends the opened and restored notices to every active channel of the merchant', async () => {
+  it('sends an incident notice and throttles follow-up notifications per merchant', async () => {
     const channels = [{ id: 'c1', type: 'email', config: { email: 'ops@merchant.example' }, active: true }];
     // Chainable, awaitable query builder: `.eq()` returns the builder and awaiting it resolves the rows.
     const supabase = {
@@ -161,11 +171,43 @@ describe('delivery observer', () => {
     expect(openedResults[0].ok).toBe(true);
 
     const restored = await observer({ ...failing, responseStatus: 200, deliveryId: 'd3' });
-    expect(restored).toHaveLength(1);
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(restored).toEqual([]);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
     const relayBodies = fetchImpl.mock.calls.map(([, init]) => JSON.parse(init.body));
     expect(relayBodies[0].subject).toMatch(/endpoint failing/);
-    expect(relayBodies[1].subject).toMatch(/Webhook Delivery Restored/);
+  });
+
+  it('alerts immediately when a delivery enters the dead-letter queue', async () => {
+    const channels = [{ id: 'c1', type: 'email', config: { email: 'ops@merchant.example' }, active: true }];
+    const supabase = {
+      from: vi.fn(() => {
+        const builder = {
+          select: () => builder,
+          eq: () => builder,
+          then: (resolve, reject) => Promise.resolve({ data: channels, error: null }).then(resolve, reject),
+        };
+        return builder;
+      }),
+    };
+    const fetchImpl = vi.fn(async () => okResponse(200));
+    const observer = createDeliveryAlertObserver(() => supabase, {
+      tracker: createIncidentTracker({ threshold: 10 }),
+      fetchImpl,
+      emailRelayUrl: 'https://relay.example/send',
+      now: () => 1,
+    });
+    await observer({
+      merchantId: 'a8c21da8-55ea-4bf8-9568-1a65923dfe54',
+      webhook: ENDPOINT,
+      eventType: 'invoice.failed',
+      responseStatus: 502,
+      deliveryId: 'dead-letter-1',
+      deadLettered: true,
+    });
+    const message = JSON.parse(fetchImpl.mock.calls[0][1].body);
+    expect(message.text).toContain('HTTP 502 Bad Gateway');
+    expect(message.text).toContain('invoice.failed');
+    expect(message.text).toContain('dead-letter-1');
   });
 
   it('is invoked for every dispatched delivery without changing the delivery result', async () => {

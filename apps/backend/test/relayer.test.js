@@ -323,6 +323,27 @@ describe('Relayer building blocks', () => {
     expect(server.getAccount).toHaveBeenCalledTimes(2);
   });
 
+  it('shares committed source sequences between workers using Redis', async () => {
+    const pk = Keypair.random().publicKey();
+    const values = new Map();
+    const redisClient = {
+      get: vi.fn(async (key) => values.get(key) ?? null),
+      set: vi.fn(async (key, value) => {
+        values.set(key, String(value));
+        return 'OK';
+      }),
+      del: vi.fn(async (key) => values.delete(key)),
+    };
+    const server = { getAccount: vi.fn(async () => new Account(pk, '7')) };
+    const workerOne = new SequenceManager(server, redisClient);
+    const workerTwo = new SequenceManager(server, redisClient);
+
+    expect((await workerOne.account(pk)).sequenceNumber()).toBe('7');
+    await workerOne.commit(pk, '8');
+    expect((await workerTwo.account(pk)).sequenceNumber()).toBe('8');
+    expect(server.getAccount).toHaveBeenCalledTimes(1);
+  });
+
   it('ChannelPool queues callers in order and times out with relayer_busy', async () => {
     const a = Keypair.random();
     const pool = new ChannelPool([a], { queueTimeoutMs: 20 });

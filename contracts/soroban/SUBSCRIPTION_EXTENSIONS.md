@@ -6,6 +6,22 @@ Revenue sharing, designated recovery, elastic metered limits, and merchant-funde
 sponsor reimbursement are documented in
 [`REVENUE_RECOVERY_ELASTICITY_SPONSORSHIP.md`](REVENUE_RECOVERY_ELASTICITY_SPONSORSHIP.md).
 
+## Commitment terms and recurring loyalty discounts (#337, #356)
+
+For an existing fixed vault, the subscriber and merchant jointly authorize
+`configure_cancellation_terms(user, merchant, min_commitment_ledgers,
+early_cancellation_fee)`. If the subscriber cancels before the configured
+ledger duration elapses, Orbit transfers the fee from the subscriber's token
+allowance to the merchant before deleting the vault. Once the commitment ends,
+cancellation has no fee. A failed transfer leaves the vault active.
+
+A merchant can configure `configure_vault_loyalty_schedule(user, merchant,
+tiers)` with increasing `{ cycle_count, discount_bps }` milestones. The
+discount for a pull is based on previously completed successful pulls, so the
+discount unlocked at cycle 3 applies starting with the next pull. The contract
+emits `loyalty_milestone` when a configured threshold is reached and records
+the number of successfully settled cycles in the vault.
+
 ## Soulbound membership (#123)
 
 Creating a fixed-interval vault creates or reactivates a non-transferable

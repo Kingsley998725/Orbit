@@ -206,6 +206,36 @@ pub struct VaultData {
     pub lifetime_cap_amount: i128,
     /// Cumulative amount successfully pulled so far (#300).
     pub total_pulled_amount: i128,
+    /// Ledger when the current vault was created; used to enforce the minimum
+    /// subscriber commitment (#356).
+    pub created_ledger: u32,
+    pub min_commitment_ledgers: u64,
+    pub early_cancellation_fee: i128,
+    /// Number of successfully settled billing pulls (#337).
+    pub settled_cycle_count: u32,
+    /// Per-vault discounts unlocked by completed billing cycles (#337).
+    pub loyalty_discount_schedule: Vec<LoyaltyDiscountTier>,
+}
+
+/// Previous full vault layout, retained for lazy migration from contracts
+/// deployed before commitment and recurring-cycle discounts were added.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultDataV1 {
+    pub token: Address,
+    pub amount_per_interval: i128,
+    pub interval_seconds: u64,
+    pub last_pull_timestamp: u64,
+    pub grace_period_seconds: u64,
+    pub payment_status: u32,
+    pub initial_timestamp: u64,
+    pub pull_sequence: u64,
+    pub is_paused: bool,
+    pub trial_end_timestamp: u64,
+    pub setup_fee: i128,
+    pub expiration_ledger: u32,
+    pub lifetime_cap_amount: i128,
+    pub total_pulled_amount: i128,
 }
 
 /// Exact v0.1.x vault layout. Used only to migrate vaults written before the
@@ -453,6 +483,14 @@ pub struct LoyaltyTier {
     pub discount_bps: u32,
 }
 
+/// Progressive loyalty discount unlocked after a number of successful pulls.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoyaltyDiscountTier {
+    pub cycle_count: u32,
+    pub discount_bps: u32,
+}
+
 /// Loyalty tokens locked in contract escrow for one subscriber (#180).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -621,6 +659,8 @@ pub enum FeatureKey {
     /// Marks a vault stored with the #300 `VaultData` layout. Without it the
     /// entry is decoded as `LegacyVaultData` and migrated on first read.
     VaultLimitSchema(Address, Address),
+    /// Marks the vault's commitment and cycle-discount layout.
+    VaultBillingSchema(Address, Address),
     /// #223: global circuit-breaker state, stored in instance storage.
     PauseState,
     /// #226: per-vault rolling-window rate limit configuration and state.
@@ -1003,41 +1043,105 @@ fn vault_schema_key(key: &VaultKey) -> FeatureKey {
     FeatureKey::VaultLimitSchema(key.user.clone(), key.merchant.clone())
 }
 
+fn vault_billing_schema_key(key: &VaultKey) -> FeatureKey {
+    FeatureKey::VaultBillingSchema(key.user.clone(), key.merchant.clone())
+}
+
 fn load_vault(env: &Env, key: &VaultKey) -> Option<VaultData> {
     let storage = env.storage().persistent();
-    if storage.has(&vault_schema_key(key)) {
+    if storage.has(&vault_billing_schema_key(key)) {
         return storage.get(key);
     }
-    // Backward-compatible migration: legacy vaults are unbounded and have
-    // pulled nothing since the cumulative counter did not exist yet.
-    storage
-        .get::<_, LegacyVaultData>(key)
-        .map(|legacy| VaultData {
-            token: legacy.token,
-            amount_per_interval: legacy.amount_per_interval,
-            interval_seconds: legacy.interval_seconds,
-            last_pull_timestamp: legacy.last_pull_timestamp,
-            grace_period_seconds: legacy.grace_period_seconds,
-            payment_status: legacy.payment_status,
-            initial_timestamp: legacy.initial_timestamp,
-            pull_sequence: legacy.pull_sequence,
-            is_paused: legacy.is_paused,
-            trial_end_timestamp: legacy.trial_end_timestamp,
-            setup_fee: legacy.setup_fee,
-            expiration_ledger: UNLIMITED_EXPIRATION_LEDGER,
-            lifetime_cap_amount: UNLIMITED_LIFETIME_CAP,
-            total_pulled_amount: 0,
-        })
+    let make_current = |token,
+                        amount_per_interval,
+                        interval_seconds,
+                        last_pull_timestamp,
+                        grace_period_seconds,
+                        payment_status,
+                        initial_timestamp,
+                        pull_sequence,
+                        is_paused,
+                        trial_end_timestamp,
+                        setup_fee,
+                        expiration_ledger,
+                        lifetime_cap_amount,
+                        total_pulled_amount| VaultData {
+        token,
+        amount_per_interval,
+        interval_seconds,
+        last_pull_timestamp,
+        grace_period_seconds,
+        payment_status,
+        initial_timestamp,
+        pull_sequence,
+        is_paused,
+        trial_end_timestamp,
+        setup_fee,
+        expiration_ledger,
+        lifetime_cap_amount,
+        total_pulled_amount,
+        created_ledger: 0,
+        min_commitment_ledgers: 0,
+        early_cancellation_fee: 0,
+        settled_cycle_count: 0,
+        loyalty_discount_schedule: Vec::new(env),
+    };
+    if storage.has(&vault_schema_key(key)) {
+        return storage.get::<_, VaultDataV1>(key).map(|previous| {
+            make_current(
+                previous.token,
+                previous.amount_per_interval,
+                previous.interval_seconds,
+                previous.last_pull_timestamp,
+                previous.grace_period_seconds,
+                previous.payment_status,
+                previous.initial_timestamp,
+                previous.pull_sequence,
+                previous.is_paused,
+                previous.trial_end_timestamp,
+                previous.setup_fee,
+                previous.expiration_ledger,
+                previous.lifetime_cap_amount,
+                previous.total_pulled_amount,
+            )
+        });
+    }
+    // Older vaults predate the lifetime-cap fields and are migrated as unbounded.
+    storage.get::<_, LegacyVaultData>(key).map(|legacy| {
+        make_current(
+            legacy.token,
+            legacy.amount_per_interval,
+            legacy.interval_seconds,
+            legacy.last_pull_timestamp,
+            legacy.grace_period_seconds,
+            legacy.payment_status,
+            legacy.initial_timestamp,
+            legacy.pull_sequence,
+            legacy.is_paused,
+            legacy.trial_end_timestamp,
+            legacy.setup_fee,
+            UNLIMITED_EXPIRATION_LEDGER,
+            UNLIMITED_LIFETIME_CAP,
+            0,
+        )
+    })
 }
 
 fn save_vault(env: &Env, key: &VaultKey, vault: &VaultData) {
     env.storage().persistent().set(key, vault);
     let schema_key = vault_schema_key(key);
     env.storage().persistent().set(&schema_key, &true);
+    let billing_schema_key = vault_billing_schema_key(key);
+    env.storage()
+        .persistent()
+        .set(&billing_schema_key, &true);
     let (threshold, extend_to) = calculate_ttl_params(vault.interval_seconds);
     env.storage()
         .persistent()
         .extend_ttl(&schema_key, threshold, extend_to);
+    env.storage()
+        .persistent()
+        .extend_ttl(&billing_schema_key, threshold, extend_to);
 }
 
 /// 0 ledger and -1 amount are the explicit unbounded sentinels. Any other
@@ -1318,9 +1422,32 @@ fn remove_vault(env: &Env, user: &Address, merchant: &Address) {
 
     if has_fixed {
         let vault = load_vault(env, &key).expect("Vault missing");
+        let commitment_end = u64::from(vault.created_ledger)
+            .saturating_add(vault.min_commitment_ledgers);
+        if u64::from(env.ledger().sequence()) < commitment_end
+            && vault.early_cancellation_fee > 0
+        {
+            token::Client::new(env, &vault.token).transfer_from(
+                &env.current_contract_address(),
+                user,
+                merchant,
+                &vault.early_cancellation_fee,
+            );
+            env.events().publish(
+                (
+                    Symbol::new(env, "early_cancel_fee"),
+                    user.clone(),
+                    merchant.clone(),
+                ),
+                vault.early_cancellation_fee,
+            );
+        }
         deactivate_badge(env, user, merchant, vault.interval_seconds);
         env.storage().persistent().remove(&key);
         env.storage().persistent().remove(&vault_schema_key(&key));
+        env.storage()
+            .persistent()
+            .remove(&vault_billing_schema_key(&key));
         env.storage()
             .persistent()
             .remove(&SubscriptionKey::Swap(user.clone(), merchant.clone()));
@@ -1435,6 +1562,11 @@ fn write_vault_with_limits(
         expiration_ledger,
         lifetime_cap_amount,
         total_pulled_amount: 0,
+        created_ledger: env.ledger().sequence(),
+        min_commitment_ledgers: 0,
+        early_cancellation_fee: 0,
+        settled_cycle_count: 0,
+        loyalty_discount_schedule: Vec::new(env),
     };
 
     save_vault(env, &key, &vault_data);
@@ -2260,6 +2392,11 @@ impl OrbitContract {
             expiration_ledger: UNLIMITED_EXPIRATION_LEDGER,
             lifetime_cap_amount: UNLIMITED_LIFETIME_CAP,
             total_pulled_amount: 0,
+            created_ledger: old_vault.created_ledger,
+            min_commitment_ledgers: old_vault.min_commitment_ledgers,
+            early_cancellation_fee: old_vault.early_cancellation_fee,
+            settled_cycle_count: old_vault.settled_cycle_count,
+            loyalty_discount_schedule: old_vault.loyalty_discount_schedule.clone(),
         };
 
         // Remove the old contract-level connection before creating the new one.
@@ -2268,6 +2405,9 @@ impl OrbitContract {
         env.storage()
             .persistent()
             .remove(&vault_schema_key(&old_key));
+        env.storage()
+            .persistent()
+            .remove(&vault_billing_schema_key(&old_key));
         env.storage()
             .persistent()
             .remove(&SubscriptionKey::Swap(user.clone(), merchant.clone()));
@@ -2707,12 +2847,77 @@ impl OrbitContract {
     }
 
     /// Close a vault so the merchant can no longer pull from it.
-    /// Only the user can cancel. The token allowance is left untouched.
+    /// Only the user can cancel. A mutually configured early fee is transferred
+    /// before the vault is removed; the remaining token allowance is untouched.
     /// Removes the fixed-interval vault and/or the metered vault (#46) for the
     /// pair; panics if neither exists.
     pub fn cancel_vault(env: Env, user: Address, merchant: Address) {
         user.require_auth();
         remove_vault(&env, &user, &merchant);
+    }
+
+    /// Configure mutually agreed early-cancellation terms for an existing vault.
+    pub fn configure_cancellation_terms(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        min_commitment_ledgers: u64,
+        early_cancellation_fee: i128,
+    ) {
+        user.require_auth();
+        merchant.require_auth();
+        assert!(early_cancellation_fee >= 0, "Cancellation fee cannot be negative");
+        let key = vault_key(&user, &merchant);
+        let mut vault = load_vault(&env, &key).expect("Vault does not exist");
+        vault.min_commitment_ledgers = min_commitment_ledgers;
+        vault.early_cancellation_fee = early_cancellation_fee;
+        save_vault(&env, &key, &vault);
+        env.events().publish(
+            (
+                Symbol::new(&env, "cancel_terms_set"),
+                user,
+                merchant,
+            ),
+            (min_commitment_ledgers, early_cancellation_fee),
+        );
+    }
+
+    /// Set progressive recurring discounts for a subscriber's existing vault.
+    pub fn configure_vault_loyalty_schedule(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        tiers: Vec<LoyaltyDiscountTier>,
+    ) {
+        merchant.require_auth();
+        assert!(tiers.len() <= MAX_LOYALTY_TIERS, "Too many loyalty tiers");
+        let mut previous_cycle = 0u32;
+        let mut previous_discount = 0u32;
+        for tier in tiers.iter() {
+            assert!(tier.cycle_count > previous_cycle, "Loyalty cycle thresholds must increase");
+            assert!(
+                tier.discount_bps > 0 && tier.discount_bps < BPS_DENOMINATOR as u32,
+                "Loyalty discount must be between 1 and 9999 basis points"
+            );
+            assert!(
+                tier.discount_bps >= previous_discount,
+                "Loyalty discounts must not decrease"
+            );
+            previous_cycle = tier.cycle_count;
+            previous_discount = tier.discount_bps;
+        }
+        let key = vault_key(&user, &merchant);
+        let mut vault = load_vault(&env, &key).expect("Vault does not exist");
+        vault.loyalty_discount_schedule = tiers.clone();
+        save_vault(&env, &key, &vault);
+        env.events().publish(
+            (
+                Symbol::new(&env, "loyalty_schedule_set"),
+                user,
+                merchant,
+            ),
+            tiers.len(),
+        );
     }
 
     pub fn merchant_cancel_vault(env: Env, merchant: Address, user: Address) {
@@ -2723,6 +2928,12 @@ impl OrbitContract {
         };
         assert!(env.storage().persistent().has(&key), "Vault does not exist");
         env.storage().persistent().remove(&key);
+        env.storage()
+            .persistent()
+            .remove(&vault_schema_key(&key));
+        env.storage()
+            .persistent()
+            .remove(&vault_billing_schema_key(&key));
         clear_recovery_state(&env, &user, &merchant);
         env.events().publish(
             (
@@ -2987,10 +3198,22 @@ impl OrbitContract {
             "Pull already settled in this billing cycle"
         );
 
-        // Loyalty discount (#180): an active stake qualifies for the merchant's
-        // best matching tier; the discounted amount is what actually settles.
+        // A successful pull advances the count by exactly one, independent of
+        // skipped calendar cycles.
+        let next_settled_cycle_count = vault
+            .settled_cycle_count
+            .checked_add(1)
+            .expect("Settled cycle count overflow");
+
+        // Apply the stronger of the existing stake-based discount and the
+        // per-vault recurring-cycle discount.
         let base_amount = vault.amount_per_interval;
-        let discount_bps = loyalty_discount_bps(&env, &user, &merchant);
+        let mut discount_bps = loyalty_discount_bps(&env, &user, &merchant);
+        for tier in vault.loyalty_discount_schedule.iter() {
+            if vault.settled_cycle_count >= tier.cycle_count {
+                discount_bps = discount_bps.max(tier.discount_bps);
+            }
+        }
         let pull_amount = if discount_bps > 0 {
             let settled = base_amount - base_amount * i128::from(discount_bps) / BPS_DENOMINATOR;
             assert!(settled > 0, "Loyalty discount would zero out the payment");
@@ -3059,6 +3282,7 @@ impl OrbitContract {
         vault.last_pull_timestamp = current_time;
         vault.payment_status = PAYMENT_ACTIVE;
         vault.pull_sequence = cycle_index;
+        vault.settled_cycle_count = next_settled_cycle_count;
         // Cumulative accounting uses the amount actually transferred (#300).
         vault.total_pulled_amount = vault
             .total_pulled_amount
@@ -3069,6 +3293,18 @@ impl OrbitContract {
             && env.ledger().sequence() >= vault.expiration_ledger;
         // Persist the full recurring charge; only this settlement was discounted.
         vault.amount_per_interval = base_amount;
+        for tier in vault.loyalty_discount_schedule.iter() {
+            if tier.cycle_count == next_settled_cycle_count {
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "loyalty_milestone"),
+                        user.clone(),
+                        merchant.clone(),
+                    ),
+                    (tier.cycle_count, tier.discount_bps),
+                );
+            }
+        }
         let amount_per_interval = vault.amount_per_interval;
         let interval_seconds = vault.interval_seconds;
         save_vault(&env, &key, &vault);
@@ -3181,10 +3417,30 @@ impl OrbitContract {
             return skipped(0);
         }
 
+        let next_settled_cycle_count = match vault.settled_cycle_count.checked_add(1) {
+            Some(count) => count,
+            None => return skipped(0),
+        };
+        let mut discount_bps = loyalty_discount_bps(env, subscriber, merchant);
+        for tier in vault.loyalty_discount_schedule.iter() {
+            if vault.settled_cycle_count >= tier.cycle_count {
+                discount_bps = discount_bps.max(tier.discount_bps);
+            }
+        }
+        let base_amount = vault.amount_per_interval;
+        let amount = if discount_bps > 0 {
+            base_amount - base_amount * i128::from(discount_bps) / BPS_DENOMINATOR
+        } else {
+            base_amount
+        };
+        if amount <= 0 {
+            return skipped(0);
+        }
+
         // The lifetime cap is a hard per-subscriber guard (#300). Skipping keeps
         // the fault-tolerant batch semantics while preventing any over-pull.
         if let Some(remaining) = remaining_vault_cap(&vault) {
-            if vault.amount_per_interval > remaining {
+            if amount > remaining {
                 return skipped(0);
             }
         }
@@ -3193,24 +3449,48 @@ impl OrbitContract {
         // letting token.transfer_from abort the whole batch. This is the most
         // common benign failure (a subscriber who topped up too late).
         let token_client = token::Client::new(env, &vault.token);
-        if token_client.balance(subscriber) < vault.amount_per_interval {
+        if token_client.balance(subscriber) < amount {
             return skipped(0);
         }
 
         // Routes through the vault's configured swap router when one exists;
         // otherwise this is a direct token.transfer_from(subscriber -> merchant).
+        vault.amount_per_interval = amount;
         pull_payment(env, subscriber, merchant, &vault, merchant);
 
-        let amount = vault.amount_per_interval;
+        vault.amount_per_interval = base_amount;
         let interval_seconds = vault.interval_seconds;
 
         vault.last_pull_timestamp = current_time;
         vault.payment_status = PAYMENT_ACTIVE;
         vault.pull_sequence = cycle_index;
+        vault.settled_cycle_count = next_settled_cycle_count;
         vault.total_pulled_amount = vault
             .total_pulled_amount
             .checked_add(amount)
             .expect("Lifetime pull total overflow");
+        if discount_bps > 0 {
+            env.events().publish(
+                (
+                    Symbol::new(env, "loyalty_discount_applied"),
+                    subscriber.clone(),
+                    merchant.clone(),
+                ),
+                (discount_bps, amount),
+            );
+        }
+        for tier in vault.loyalty_discount_schedule.iter() {
+            if tier.cycle_count == next_settled_cycle_count {
+                env.events().publish(
+                    (
+                        Symbol::new(env, "loyalty_milestone"),
+                        subscriber.clone(),
+                        merchant.clone(),
+                    ),
+                    (tier.cycle_count, tier.discount_bps),
+                );
+            }
+        }
         let cap_reached = remaining_vault_cap(&vault) == Some(0);
         let expiration_reached = vault.expiration_ledger != UNLIMITED_EXPIRATION_LEDGER
             && env.ledger().sequence() >= vault.expiration_ledger;

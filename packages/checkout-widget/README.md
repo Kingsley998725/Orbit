@@ -14,6 +14,8 @@ The widget configures only these tree-shakeable modules from Stellar Wallets Kit
 
 The selected wallet is persisted in `localStorage`. Use `allowedWallets` to expose a subset.
 
+When the wallet picker opens, the widget probes injected browser extensions (Freighter via `window.freighterApi` and xBull via `window.xbull` or `window.xBullSDK`) within 300ms. Detected wallets are badged **Installed**, moved to the top of the list, and, when exactly one supported wallet is found, offered as a one-click "Quick connect" CTA. If no extension is detected, the standard wallet list renders unchanged.
+
 ## Setup
 
 ```bash
