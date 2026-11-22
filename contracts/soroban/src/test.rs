@@ -5274,3 +5274,119 @@ fn test_delegated_and_meta_signatures_share_one_nonce() {
         .is_err());
     assert_eq!(f.orbit.get_user_nonce(&f.user), 1);
 }
+
+// ----------------------------------------------------------------------------
+// ISSUE #316: BATCH ALLOWANCE RENEWAL
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_batch_renew_vaults_with_active_expired_and_missing_merchants() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let active_merchant = Address::generate(&env);
+    let expired_merchant = Address::generate(&env);
+    let missing_merchant = Address::generate(&env);
+    let token_address = Address::generate(&env);
+
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+
+    let start_sequence = env.ledger().sequence();
+    let extension = 500u64;
+    orbit.create_vault_with_limits(
+        &user,
+        &active_merchant,
+        &token_address,
+        &100,
+        &100,
+        &(start_sequence + 200),
+        &UNLIMITED_LIFETIME_CAP,
+    );
+    orbit.create_vault_with_limits(
+        &user,
+        &expired_merchant,
+        &token_address,
+        &100,
+        &100,
+        &(start_sequence + 20),
+        &UNLIMITED_LIFETIME_CAP,
+    );
+
+    env.ledger().set_sequence_number(start_sequence + 30);
+    assert_eq!(
+        orbit
+            .get_vault(&user, &expired_merchant)
+            .unwrap()
+            .expiration_ledger,
+        start_sequence + 20
+    );
+
+    let merchants = soroban_sdk::vec![
+        &env,
+        active_merchant.clone(),
+        expired_merchant.clone(),
+        missing_merchant.clone()
+    ];
+    orbit.mock_auths(&[MockAuth {
+        address: &user,
+        invoke: &MockAuthInvoke {
+            contract: &orbit.address,
+            fn_name: "batch_renew_vaults",
+            args: (&user, &merchants, &extension).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    let expected_active_expiration = start_sequence + 200 + extension as u32;
+    orbit.batch_renew_vaults(&user, &merchants, &extension);
+    let renewal_events = env.events().all();
+
+    let renewed_active = orbit.get_vault(&user, &active_merchant).unwrap();
+    assert_eq!(renewed_active.expiration_ledger, expected_active_expiration);
+
+    let expected_expired_expiration = start_sequence + 30 + extension as u32;
+    let renewed_expired = orbit.get_vault(&user, &expired_merchant).unwrap();
+    assert_eq!(
+        renewed_expired.expiration_ledger,
+        expected_expired_expiration
+    );
+    assert_eq!(renewed_expired.payment_status, PAYMENT_ACTIVE);
+    assert!(renewed_expired.expiration_ledger > env.ledger().sequence());
+
+    assert!(orbit.get_vault(&user, &missing_merchant).is_none());
+
+    let topics = soroban_sdk::vec![
+        &env,
+        Symbol::new(&env, "batch_vaults_renewed").to_val(),
+        user.to_val()
+    ];
+    let data = (2u32, expected_active_expiration).into_val(&env);
+    assert_eq!(
+        renewal_events,
+        soroban_sdk::vec![&env, (orbit.address.clone(), topics, data)]
+    );
+}
+
+#[test]
+fn test_batch_renew_vaults_requires_one_user_authorization() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let contract_id = env.register(OrbitContract, ());
+    let orbit = OrbitContractClient::new(&env, &contract_id);
+    orbit.create_vault(&user, &merchant, &token, &100, &100);
+
+    env.set_auths(&[]);
+    let merchants = soroban_sdk::vec![&env, merchant.clone()];
+    assert!(orbit
+        .try_batch_renew_vaults(&user, &merchants, &100)
+        .is_err());
+    assert_eq!(
+        orbit.get_vault(&user, &merchant).unwrap().expiration_ledger,
+        0
+    );
+}

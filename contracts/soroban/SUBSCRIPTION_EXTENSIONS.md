@@ -88,6 +88,18 @@ operators should use a separately governed arbitrator contract if those
 guarantees are required. Preexisting escrow holds retain their original
 arbitrator and deadline if the subscription configuration changes.
 
+## Batch vault renewal (#316)
+
+Subscribers with several active merchants can call
+`batch_renew_vaults(user, merchants, extension_ledgers)` with one signature.
+Each existing vault gets its `expiration_ledger` extended from the later of its
+current deadline and the current ledger, plus `extension_ledgers`; its
+persistent and instance storage TTLs are refreshed in the same transaction.
+Missing vaults are skipped, and a consumed lifetime cap is never revived.
+An expired vault with remaining cap is reactivated. One
+`batch_vaults_renewed` event reports the number of renewed vaults and the
+latest new deadline.
+
 ## Verification
 
 From `contracts/soroban`, run:
